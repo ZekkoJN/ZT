@@ -19,13 +19,21 @@ from dotenv import load_dotenv
 
 # Import modul kustom
 from ai_service import get_gemini_service
-from data_miner import get_comtrade_api
+from data_miner import fetch_comtrade_data, extract_and_fetch_data
 from database import get_db_manager
 from utils import (
     clean_hs_code, extract_hs_codes_from_ai, get_best_hs_code,
-    get_hs_code_description, calculate_cagr, calculate_value_added,
-    format_currency, format_currency_compact
+    get_hs_code_description, format_currency_compact, select_hs_codes_with_conflict_resolution
 )
+
+# Try to import Gurobi modules (optional)
+try:
+    from gurobi_modules.market_sharing import solve_competitor_displacement
+    from gurobi_modules.supply_network import solve_price_arbitrage
+    GUROBI_AVAILABLE = True
+except ImportError:
+    GUROBI_AVAILABLE = False
+    print("Warning: Gurobi modules not available. Optimization features will be disabled.")
 
 # Muat variabel environment
 load_dotenv()
@@ -64,23 +72,6 @@ st.markdown("""
         padding: 1rem;
         border-radius: 0.5rem;
         margin: 0.5rem 0;
-    }
-    .recommendation-box {
-        padding: 1.5rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-        font-size: 1.1rem;
-        font-weight: bold;
-    }
-    .recommendation-positive {
-        background-color: #d4edda;
-        color: #155724;
-        border: 2px solid #28a745;
-    }
-    .recommendation-negative {
-        background-color: #f8d7da;
-        color: #721c24;
-        border: 2px solid #dc3545;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -143,7 +134,6 @@ def perform_analysis(commodity_input: str):
         progress_bar.progress(10)
 
         gemini = get_gemini_service()
-        comtrade = get_comtrade_api()
         db = get_db_manager()
 
         # Step 2: Cek cache
@@ -181,14 +171,15 @@ def perform_analysis(commodity_input: str):
                     "Alasan Jalur": ai_result.get('selected_path_reason', 'N/A')
                 })
 
-            # Step 4: Ambil dan bersihkan HS codes dari AI
+            # Step 4: Ambil dan bersihkan HS codes dari AI dengan resolusi konflik
             status_text.text("🔍 Memproses HS Code dari AI...")
             progress_bar.progress(40)
 
-            # Ekstrak HS codes untuk setiap stage
-            raw_hs_code = get_best_hs_code(ai_result, 'raw')
-            semi_hs_code = get_best_hs_code(ai_result, 'semi')
-            finished_hs_code = get_best_hs_code(ai_result, 'finished')
+            # Pilih HS codes untuk semua stage dengan menghindari konflik
+            hs_codes = select_hs_codes_with_conflict_resolution(ai_result)
+            raw_hs_code = hs_codes['raw']
+            semi_hs_code = hs_codes['semi']
+            finished_hs_code = hs_codes['finished']
 
             if not raw_hs_code:
                 st.error("❌ AI tidak dapat menentukan HS Code bahan mentah. Coba dengan kata kunci lain.")
@@ -203,12 +194,22 @@ def perform_analysis(commodity_input: str):
             semi_desc = get_hs_code_description(ai_result, 'semi', semi_hs_code) if semi_hs_code else 'N/A'
             finished_desc = get_hs_code_description(ai_result, 'finished', finished_hs_code)
 
+            # Cek apakah ada konflik HS code yang di-resolve
+            conflict_note = ""
+            if raw_hs_code and semi_hs_code and raw_hs_code == semi_hs_code:
+                conflict_note = " ⚠️ **Catatan:** HS Code bahan mentah dan setengah jadi sama karena keterbatasan klasifikasi UN Comtrade untuk produk herbal."
+            elif raw_hs_code and finished_hs_code and raw_hs_code == finished_hs_code:
+                conflict_note = " ⚠️ **Catatan:** HS Code bahan mentah dan produk jadi sama karena keterbatasan klasifikasi UN Comtrade untuk produk herbal."
+            elif semi_hs_code and finished_hs_code and semi_hs_code == finished_hs_code:
+                conflict_note = " ⚠️ **Catatan:** HS Code setengah jadi dan produk jadi sama karena keterbatasan klasifikasi UN Comtrade untuk produk herbal."
+
             # Tampilkan HS codes yang ditemukan untuk verifikasi user
             st.info(f"""
             🔍 **HS Codes dari AI (dibersihkan untuk UN Comtrade):**
             - **Bahan Mentah:** {raw_hs_code} - {raw_desc}
             - **Setengah Jadi:** {semi_hs_code or 'N/A'} - {semi_desc}
             - **Produk Jadi:** {finished_hs_code} - {finished_desc}
+            {conflict_note}
             """)
 
             # Tampilkan semua alternatif HS codes
@@ -237,60 +238,80 @@ def perform_analysis(commodity_input: str):
 
             # Simpan pencarian ke cache
             if db:
-                db.cache_commodity_search(commodity_input, ai_result, raw_hs_code, finished_hs_code)
+                db.cache_commodity_search(commodity_input, ai_result, raw_hs_code, semi_hs_code, finished_hs_code)
 
-        # Step 5: Eksekusi 4-Request Protocol
-        status_text.text("📡 Mengambil data perdagangan (4-Request)...")
+        # Step 5: Ambil data untuk optimasi Gurobi
+        status_text.text("📡 Mengambil data untuk optimasi...")
         progress_bar.progress(60)
 
-        years = list(range(datetime.now().year - st.session_state.get('years_to_analyze', 5), datetime.now().year + 1))
-        protocol_results = comtrade.four_request_protocol(raw_hs_code, semi_hs_code, finished_hs_code, years)
+        years_to_analyze = st.session_state.get('years_to_analyze', 3)
+        start_year = datetime.now().year - years_to_analyze
+        end_year = datetime.now().year
 
-        # Step 6: Analisis dan generate rekomendasi
-        status_text.text("📈 Menganalisis data...")
+        # Gunakan extract_and_fetch_data untuk mendapatkan data semua kategori sekaligus
+        # Untuk supply: gunakan raw_hs_code
+        # Untuk competitor & demand: gunakan finished_hs_code
+        # Jika ada semi: gunakan untuk competitor
+        
+        # Ambil data Supply (ekspor Indonesia) - bahan dasar menggunakan extract_and_fetch_data
+        supply_results, supply_ai_info = extract_and_fetch_data(commodity_input, start_year, end_year, mode='supply')
+        df_supply = supply_results.get('raw', pd.DataFrame())
+        
+        # Ambil data Competitor (ekspor negara lain) - produk jadi
+        df_competitor = fetch_comtrade_data(finished_hs_code, start_year, end_year, mode='competitor')
+        
+        # Ambil data Demand (impor dunia) - produk jadi
+        df_demand = fetch_comtrade_data(finished_hs_code, start_year, end_year, mode='demand')
+
+        # Jika ada semi_hs_code, ambil data demand untuk semi juga
+        if semi_hs_code:
+            df_demand_semi = fetch_comtrade_data(semi_hs_code, start_year, end_year, mode='demand')
+
+        # Step 6: Jalankan Optimasi Gurobi
+        status_text.text("🎯 Menjalankan optimasi matematis...")
         progress_bar.progress(80)
 
-        analysis = protocol_results['analysis']
+        optimization_results = {}
 
-        # Generate rekomendasi
-        recommendation = generate_recommendation(analysis)
+        if GUROBI_AVAILABLE:
+            # Optimasi untuk Bahan Mentah (Strategi B1: Competitor Displacement)
+            if not df_supply.empty:
+                b1_result = solve_competitor_displacement(df_supply, df_competitor)
+                optimization_results['raw'] = b1_result
 
-        # Generate ringkasan AI
+            # Optimasi untuk Produk Jadi (Strategi B3: Price Arbitrage)  
+            if not df_supply.empty and not df_demand.empty:
+                b3_result = solve_price_arbitrage(df_supply, df_demand)
+                optimization_results['finished'] = b3_result
+
+            # Jika ada Semi, gunakan B3 juga
+            if semi_hs_code and not df_supply.empty and not df_demand.empty:
+                # Untuk semi, gunakan HS code semi tapi data supply tetap dari raw
+                df_demand_semi = fetch_comtrade_data(semi_hs_code, start_year, end_year, mode='demand')
+                if not df_demand_semi.empty:
+                    b3_semi_result = solve_price_arbitrage(df_supply, df_demand_semi)
+                    optimization_results['semi'] = b3_semi_result
+        else:
+            optimization_results = {"status": "Gurobi not available", "reason": "Optimization features disabled"}
+
+        # Step 7: Generate ringkasan AI
         status_text.text("✍️ Membuat ringkasan analisis...")
         progress_bar.progress(90)
 
-        raw_data = {
-            'total_value': analysis['raw_export_total'],
-            'cagr': round(analysis['raw_export_trend'], 2)
-        }
-
-        finished_data = {
-            'export_value': analysis['finished_export_total'],
-            'world_import': analysis['global_demand_total'],
-            'gap': analysis['market_gap'],
-            'cagr': round(analysis['global_demand_trend'], 2)
-        }
-
+        # Generate ringkasan AI berdasarkan hasil optimasi
         ai_summary = gemini.generate_analysis_summary(
             commodity=ai_result['commodity_name'],
-            raw_data=raw_data,
-            finished_data=finished_data,
-            recommendations=recommendation
+            optimization_results=optimization_results
         )
 
-        # Simpan ke database
+        # Simpan ke database (update schema jika perlu)
         if db:
             db.save_analysis_result({
                 'commodity_name': ai_result['commodity_name'],
                 'raw_hs_code': raw_hs_code,
+                'semi_hs_code': semi_hs_code,
                 'finished_hs_code': finished_hs_code,
-                'raw_export_value': analysis['raw_export_total'],
-                'finished_export_value': analysis['finished_export_total'],
-                'global_demand_value': analysis['global_demand_total'],
-                'market_gap': analysis['market_gap'],
-                'cagr_raw': analysis['raw_export_trend'],
-                'cagr_finished': analysis['global_demand_trend'],
-                'recommendation': recommendation['decision'],
+                'optimization_results': optimization_results,
                 'analysis_summary': ai_summary
             })
 
@@ -300,11 +321,14 @@ def perform_analysis(commodity_input: str):
             'raw_hs_code': raw_hs_code,
             'semi_hs_code': semi_hs_code,
             'finished_hs_code': finished_hs_code,
-            'analysis': analysis,
-            'recommendation': recommendation,
+            'optimization_results': optimization_results,
             'ai_summary': ai_summary,
-            'protocol_data': protocol_results['data'],
-            'ai_result': ai_result  # Sertakan AI result untuk reasoning path
+            'protocol_data': {
+                'supply': df_supply,
+                'competitor': df_competitor, 
+                'demand': df_demand
+            },
+            'ai_result': ai_result
         }
 
         st.session_state.analysis_complete = True
@@ -316,114 +340,6 @@ def perform_analysis(commodity_input: str):
         st.error(f"Terjadi kesalahan: {str(e)}")
         import traceback
         st.error(traceback.format_exc())
-
-
-def generate_recommendation(analysis: dict) -> dict:
-    """
-    Generate downstreaming recommendation based on analysis
-
-    Args:
-        analysis: Analysis results
-
-    Returns:
-        Recommendation dictionary with detailed reasoning
-    """
-    recommendation = {
-        'decision': 'TIDAK LAYAK HILIRISASI',
-        'reason': '',
-        'score': 0,
-        'details': []
-    }
-
-    score = 0
-    reasons = []
-    details = []
-
-    # Faktor 1: Gap pasar (30%)
-    gap = analysis['market_gap']
-    if gap > 1_000_000_000:  # > $1B gap
-        score += 30
-        reasons.append(f"Gap pasar global sangat besar (${gap/1_000_000_000:.2f}B), menunjukkan peluang ekspor yang sangat potensial")
-        details.append(f"Permintaan global mencapai ${analysis['global_demand_total']/1_000_000_000:.2f}B sementara ekspor Indonesia hanya ${analysis['finished_export_total']/1_000_000:.2f}M")
-    elif gap > 100_000_000:  # > $100M gap
-        score += 20
-        reasons.append(f"Gap pasar global signifikan (${gap/1_000_000:.2f}M), ada ruang untuk ekspansi ekspor")
-        # Perlindungan pembagian dengan nol
-        if analysis['global_demand_total'] > 0:
-            market_share = (analysis['finished_export_total']/analysis['global_demand_total']*100)
-            details.append(f"Indonesia baru menguasai {market_share:.1f}% dari permintaan global")
-        else:
-            details.append("Data permintaan global tidak tersedia untuk perbandingan")
-    elif gap < 0:
-        reasons.append("Gap pasar negatif - ekspor produk jadi sudah melebihi permintaan global terdata")
-        details.append("Perlu evaluasi lebih lanjut tentang pasar tujuan yang belum terdata")
-    else:
-        reasons.append(f"Gap pasar kecil (${gap/1_000_000:.2f}M), peluang terbatas")
-
-    # Faktor 2: Pertumbuhan permintaan (30%)
-    demand_cagr = analysis['global_demand_trend']
-    if demand_cagr > 10:  # >10% CAGR
-        score += 30
-        reasons.append(f"Pertumbuhan permintaan global sangat tinggi ({demand_cagr:.1f}% CAGR), pasar sedang berkembang pesat")
-        details.append("Momentum pasar sangat baik untuk memulai hilirisasi sekarang")
-    elif demand_cagr > 5:  # >5% CAGR
-        score += 20
-        reasons.append(f"Pertumbuhan permintaan global positif ({demand_cagr:.1f}% CAGR)")
-        details.append("Pasar menunjukkan tren pertumbuhan yang sehat")
-    elif demand_cagr > 0:
-        score += 10
-        reasons.append(f"Pertumbuhan permintaan global lambat ({demand_cagr:.1f}% CAGR)")
-        details.append("Pasar masih tumbuh namun tidak agresif")
-    else:
-        reasons.append(f"Permintaan global menurun ({demand_cagr:.1f}% CAGR), pasar sedang kontraksi")
-        details.append("Risiko tinggi untuk investasi hilirisasi saat ini")
-
-    # Faktor 3: Kemampuan ekspor saat ini (20%)
-    current_ratio = (analysis['finished_export_total'] / analysis['raw_export_total'] * 100) if analysis['raw_export_total'] > 0 else 0
-    if analysis['finished_export_total'] < analysis['raw_export_total'] * 0.1:
-        score += 20
-        reasons.append(f"Ekspor produk jadi sangat rendah ({current_ratio:.1f}% dari bahan mentah), potensi nilai tambah sangat besar")
-        details.append("Indonesia saat ini lebih banyak mengekspor bahan mentah - kehilangan nilai tambah besar")
-    elif analysis['finished_export_total'] < analysis['raw_export_total'] * 0.5:
-        score += 10
-        reasons.append(f"Ekspor produk jadi masih rendah ({current_ratio:.1f}% dari bahan mentah)")
-        details.append("Masih ada ruang signifikan untuk meningkatkan hilirisasi")
-    else:
-        reasons.append(f"Ekspor produk jadi sudah cukup tinggi ({current_ratio:.1f}% dari bahan mentah)")
-        details.append("Industri hilirisasi sudah cukup berkembang")
-
-    # Faktor 4: Ketersediaan bahan mentah (20%)
-    raw_export = analysis['raw_export_total']
-    if raw_export > 100_000_000:  # > $100M
-        score += 20
-        reasons.append(f"Ketersediaan bahan mentah sangat mencukupi (${raw_export/1_000_000:.2f}M ekspor per tahun)")
-        details.append("Pasokan bahan baku memadai untuk mendukung industri hilirisasi skala besar")
-    elif raw_export > 10_000_000:  # > $10M
-        score += 10
-        reasons.append(f"Ketersediaan bahan mentah mencukupi (${raw_export/1_000_000:.2f}M ekspor per tahun)")
-        details.append("Pasokan bahan baku cukup untuk industri hilirisasi skala menengah")
-    else:
-        reasons.append(f"Ketersediaan bahan mentah terbatas (${raw_export/1_000_000:.2f}M ekspor per tahun)")
-        details.append("Perlu evaluasi kecukupan pasokan bahan baku untuk hilirisasi")
-
-    # Logika keputusan
-    if score >= 60:
-        recommendation['decision'] = 'LAYAK HILIRISASI'
-        recommendation['score'] = score
-        recommendation['reason'] = '; '.join(reasons)
-        recommendation['details'] = details
-        recommendation['details'].append("💡 Rekomendasi: Segera mulai investasi hilirisasi atau tingkatkan kapasitas yang ada")
-    else:
-        recommendation['decision'] = 'TIDAK LAYAK HILIRISASI'
-        recommendation['score'] = score
-        if not reasons:
-            recommendation['reason'] = 'Faktor-faktor ekonomi belum mendukung hilirisasi'
-        else:
-            recommendation['reason'] = '; '.join(reasons)
-        recommendation['details'] = details
-        recommendation['details'].append("⚠️ Rekomendasi: Tunda investasi hilirisasi hingga kondisi pasar lebih mendukung, atau fokus pada peningkatan kualitas bahan mentah")
-
-    return recommendation
 
 
 def render_results():
@@ -471,117 +387,47 @@ def render_results():
 
     st.markdown("---")
 
-    # Metrik utama
-    st.markdown("### 💹 Metrik Utama")
+    # Hasil Optimasi Gurobi
+    st.markdown("### 🎯 Hasil Optimasi Matematis")
 
-    # Tampilkan warning year alignment jika berlaku
-    if 'aligned_years' in results['analysis'] and 'excluded_years' in results['analysis']:
-        aligned_years = results['analysis']['aligned_years']
-        excluded = results['analysis']['excluded_years']
+    opt_results = results.get('optimization_results', {})
 
-        if excluded['global_only']:
-            st.warning(f"""
-            ⚠️ **Penyesuaian Data Perbandingan:** Permintaan Global memiliki data untuk tahun {', '.join(map(str, excluded['global_only']))},
-            tetapi data Ekspor Indonesia untuk tahun tersebut belum tersedia di UN Comtrade.
+    # Tampilkan hasil untuk setiap stage
+    stages = [('raw', 'Bahan Mentah'), ('semi', 'Setengah Jadi'), ('finished', 'Produk Jadi')]
+    
+    for stage_key, stage_name in stages:
+        if stage_key in opt_results:
+            opt = opt_results[stage_key]
             
-            📊 **Data tahun tersebut tetap ditampilkan di grafik** (garis putus-putus), namun **tidak digunakan dalam perhitungan metrik** 
-            (total, CAGR, gap pasar).
-            
-            Perbandingan metrik hanya menggunakan tahun {aligned_years[0]}-{aligned_years[-1]} dimana KEDUA dataset memiliki data.
-            """)
-        elif excluded['indonesia_only']:
-            st.info(f"""
-            ℹ️ **Penyesuaian Data Perbandingan:** Data Ekspor Indonesia memiliki data untuk tahun {', '.join(map(str, excluded['indonesia_only']))},
-            tetapi data Permintaan Global untuk tahun tersebut belum tersedia.
-            
-            📊 **Data tahun tersebut tetap ditampilkan di grafik** (garis putus-putus), namun **tidak digunakan dalam perhitungan metrik** 
-            (total, CAGR, gap pasar).
-            
-            Perbandingan metrik menggunakan tahun {aligned_years[0]}-{aligned_years[-1]} dimana KEDUA dataset memiliki data.
-            """)
-
-        if aligned_years:
-            st.caption(f"📅 Rentang tahun analisis: **{aligned_years[0]} - {aligned_years[-1]}** ({len(aligned_years)} tahun)")
-
-    # Ambil nama produk dari hasil AI
-    raw_product_name = ""
-    semi_product_name = ""
-    finished_product_name = ""
-
-    if 'ai_result' in results:
-        raw_product_name = results['ai_result'].get('raw_material', '')
-        semi_product_name = results['ai_result'].get('semi_finished', '')
-        finished_product_name = results['ai_result'].get('finished_product', '')
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-
-    with col1:
-        st.metric(
-            f"Ekspor Bahan Mentah",
-            format_currency_compact(results['analysis']['raw_export_total']),
-            f"{results['analysis']['raw_export_trend']:.1f}% CAGR"
-        )
-        st.caption(f"📦 {raw_product_name}")
-
-    with col2:
-        st.metric(
-            f"Ekspor Setengah Jadi",
-            format_currency_compact(results['analysis'].get('semi_export_total', 0)),
-            f"{results['analysis'].get('semi_export_trend', 0):.1f}% CAGR"
-        )
-        st.caption(f"🔧 {semi_product_name}")
-
-    with col3:
-        st.metric(
-            f"Ekspor Produk Jadi",
-            format_currency_compact(results['analysis']['finished_export_total']),
-            f"{results['analysis'].get('finished_export_trend', 0):.1f}% CAGR"
-        )
-        st.caption(f"✨ {finished_product_name}")
-
-    with col4:
-        st.metric(
-            "Permintaan Global",
-            format_currency_compact(results['analysis']['global_demand_total']),
-            f"{results['analysis']['global_demand_trend']:.1f}% CAGR"
-        )
-        st.caption(f"🌍 {finished_product_name}")
-
-    with col5:
-        st.metric(
-            "Gap Pasar (Peluang)",
-            format_currency_compact(results['analysis']['market_gap'])
-        )
-        st.caption(f"💡 {finished_product_name}")
-
-    # Rekomendasi
-    st.markdown("---")
-    st.markdown("### 🎯 Rekomendasi")
-
-    rec = results['recommendation']
-    is_positive = rec['decision'] == 'LAYAK HILIRISASI'
-
-    box_class = "recommendation-positive" if is_positive else "recommendation-negative"
-    icon = "✅" if is_positive else "❌"
-
-    st.markdown(f"""
-    <div class="recommendation-box {box_class}">
-        {icon} <strong>{rec['decision']}</strong> (Skor: {rec['score']}/100)
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Alasan detail
-    st.markdown("#### 📋 Alasan:")
-    reasoning_points = rec['reason'].split(';') if ';' in rec['reason'] else [rec['reason']]
-    for point in reasoning_points:
-        if point.strip():
-            st.markdown(f"- {point.strip()}")
-
-    # Pertimbangan tambahan
-    if 'details' in rec and rec['details']:
-        st.markdown("#### 💡 Pertimbangan Tambahan:")
-        for detail in rec['details']:
-            st.markdown(f"- {detail}")
+            if opt.get('status') == 'Optimal':
+                st.markdown(f"#### 📦 {stage_name}")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric(
+                        "Potensi Devisa ($)",
+                        format_currency_compact(opt.get('total_revenue', 0))
+                    )
+                with col2:
+                    st.metric(
+                        "Volume Alokasi (Kg)",
+                        format_currency_compact(opt.get('total_volume', 0))
+                    )
+                with col3:
+                    strategy = opt.get('strategy', 'N/A')
+                    st.metric("Strategi", strategy)
+                
+                # Tampilkan detail alokasi
+                if 'details' in opt and opt['details']:
+                    with st.expander(f"📋 Detail Alokasi {stage_name}", expanded=False):
+                        for detail in opt['details'][:5]:  # Tampilkan top 5
+                            st.markdown(f"""
+                            - **{detail.get('Negara Tujuan', 'N/A')}**: 
+                              {format_currency_compact(detail.get('Volume Alokasi (Kg)', 0))} kg → 
+                              ${format_currency_compact(detail.get('Potensi Devisa ($)', 0))}
+                            """)
+            else:
+                st.warning(f"⚠️ Optimasi {stage_name} gagal: {opt.get('reason', 'Unknown error')}")
 
     # Ringkasan AI
     st.markdown("---")
@@ -593,189 +439,85 @@ def render_results():
     st.markdown("### 📈 Visualisasi Data")
 
     # Buat visualisasi jika data tersedia
-    render_visualizations(results['protocol_data'], results['analysis'])
+    render_visualizations(results['protocol_data'])
 
 
-def render_visualizations(data: dict, analysis: dict):
+def render_visualizations(data: dict):
     """
-    Render data visualizations as line charts with time series
+    Render data visualizations for optimization results
 
     Args:
         data: Protocol data containing time series export/import data
-        analysis: Analysis results
     """
     # Ekstrak data time series dari protocol
-    raw_exports = data.get('indonesia_raw_export', pd.DataFrame())
-    semi_exports = data.get('indonesia_semi_export', pd.DataFrame())
-    finished_exports = data.get('indonesia_finished_export', pd.DataFrame())
-    global_imports = data.get('world_finished_import', pd.DataFrame())
+    supply_data = data.get('supply', pd.DataFrame())
+    competitor_data = data.get('competitor', pd.DataFrame())
+    demand_data = data.get('demand', pd.DataFrame())
 
-    # Ambil tahun yang selaras untuk filter
-    aligned_years = analysis.get('aligned_years', [])
-    excluded_years = analysis.get('excluded_years', {'indonesia_only': [], 'global_only': []})
-
-    # Proses data per tahun
-    def aggregate_by_year(df):
-        if df.empty or 'period' not in df.columns or 'primaryValue' not in df.columns:
+    # Fungsi helper untuk aggregate data per tahun
+    def aggregate_by_year(df, value_col='TradeValue'):
+        if df.empty:
             return pd.DataFrame()
 
-        yearly = df.groupby('period')['primaryValue'].sum().reset_index()
+        # Cek berbagai kemungkinan nama kolom
+        period_cols = ['Period', 'period', 'ps']
+        value_cols = ['TradeValue', 'PrimaryValue', 'tradeValue', 'primaryValue']
+
+        period_col = None
+        for col in period_cols:
+            if col in df.columns:
+                period_col = col
+                break
+
+        actual_value_col = value_col
+        for col in value_cols:
+            if col in df.columns:
+                actual_value_col = col
+                break
+
+        if period_col is None or actual_value_col not in df.columns:
+            return pd.DataFrame()
+
+        yearly = df.groupby(period_col)[actual_value_col].sum().reset_index()
         yearly.columns = ['Year', 'Value']
         yearly = yearly.sort_values('Year')
         return yearly
 
-    # Tampilkan SEMUA tahun yang tersedia 
-    raw_yearly = aggregate_by_year(raw_exports)
-    semi_yearly = aggregate_by_year(semi_exports)
-    finished_yearly = aggregate_by_year(finished_exports)
-    global_yearly = aggregate_by_year(global_imports)
+    # Aggregate data
+    supply_yearly = aggregate_by_year(supply_data)
+    competitor_yearly = aggregate_by_year(competitor_data)
+    demand_yearly = aggregate_by_year(demand_data)
 
-    col1, col2 = st.columns(2)
+    # Tampilkan data dalam tabel sederhana
+    st.markdown("#### 📊 Data Ekspor Indonesia (Supply)")
+    if not supply_yearly.empty:
+        st.dataframe(supply_yearly, use_container_width=True)
+        st.info(f"📈 Total records: {len(supply_data)} | Columns: {list(supply_data.columns)}")
+    else:
+        st.info("Data supply tidak tersedia")
+        if not supply_data.empty:
+            st.warning(f"Data ada tapi kosong setelah aggregate. Columns: {list(supply_data.columns)}")
+            st.dataframe(supply_data.head(), use_container_width=True)
 
-    with col1:
-        # Grafik 1: Tren ekspor per tahun
-        st.markdown("#### 📊 Tren Ekspor Indonesia (Rentang Waktu)")
+    st.markdown("#### 📊 Data Kompetitor")
+    if not competitor_yearly.empty:
+        st.dataframe(competitor_yearly, use_container_width=True)
+        st.info(f"📈 Total records: {len(competitor_data)} | Columns: {list(competitor_data.columns)}")
+    else:
+        st.info("Data kompetitor tidak tersedia")
+        if not competitor_data.empty:
+            st.warning(f"Data ada tapi kosong setelah aggregate. Columns: {list(competitor_data.columns)}")
+            st.dataframe(competitor_data.head(), use_container_width=True)
 
-        fig = go.Figure()
-
-        if not raw_yearly.empty:
-            fig.add_trace(go.Scatter(
-                x=raw_yearly['Year'],
-                y=raw_yearly['Value'],
-                mode='lines+markers',
-                name='Bahan Mentah',
-                line=dict(color='#ff7f0e', width=3),
-                marker=dict(size=8)
-            ))
-
-        if not semi_yearly.empty:
-            fig.add_trace(go.Scatter(
-                x=semi_yearly['Year'],
-                y=semi_yearly['Value'],
-                mode='lines+markers',
-                name='Setengah Jadi',
-                line=dict(color='#9467bd', width=3),
-                marker=dict(size=8)
-            ))
-
-        if not finished_yearly.empty:
-            fig.add_trace(go.Scatter(
-                x=finished_yearly['Year'],
-                y=finished_yearly['Value'],
-                mode='lines+markers',
-                name='Produk Jadi',
-                line=dict(color='#2ca02c', width=3),
-                marker=dict(size=8)
-            ))
-
-        fig.update_layout(
-            xaxis_title="Tahun",
-            yaxis_title="Nilai Ekspor (USD)",
-            height=450,
-            hovermode='x unified',
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="center",
-                x=0.5
-            )
-        )
-
-        if raw_yearly.empty and semi_yearly.empty and finished_yearly.empty:
-            st.warning("Tidak ada data ekspor untuk ditampilkan")
-        else:
-            st.plotly_chart(fig, width='stretch')
-
-    with col2:
-        # Grafik 2: Gap pasar dan tren permintaan
-        st.markdown("#### 🌍 Permintaan Global vs Ekspor Indonesia")
-
-        fig = go.Figure()
-
-        # Tampilkan SEMUA data global 
-        if not global_yearly.empty:
-            # Pisahkan data berdasarkan aligned dan non-aligned years
-            global_aligned = global_yearly[global_yearly['Year'].isin(aligned_years)] if aligned_years else global_yearly
-            global_only = global_yearly[global_yearly['Year'].isin(excluded_years['global_only'])] if excluded_years['global_only'] else pd.DataFrame()
-            
-            # Data yang dibandingkan 
-            if not global_aligned.empty:
-                fig.add_trace(go.Scatter(
-                    x=global_aligned['Year'],
-                    y=global_aligned['Value'],
-                    mode='lines+markers',
-                    name='Permintaan Global (dibandingkan)',
-                    line=dict(color='#1f77b4', width=3),
-                    marker=dict(size=8),
-                    fill='tozeroy',
-                    fillcolor='rgba(31, 119, 180, 0.1)'
-                ))
-            
-            # Data yang TIDAK dibandingkan 
-            if not global_only.empty:
-                fig.add_trace(go.Scatter(
-                    x=global_only['Year'],
-                    y=global_only['Value'],
-                    mode='lines+markers',
-                    name='Permintaan Global (tidak dibandingkan)',
-                    line=dict(color='#1f77b4', width=2, dash='dash'),
-                    marker=dict(size=6, symbol='circle-open'),
-                    opacity=0.6
-                ))
-
-        # Tampilkan SEMUA data Indonesia
-        if not finished_yearly.empty:
-            # Pisahkan data berdasarkan aligned dan non-aligned years
-            finished_aligned = finished_yearly[finished_yearly['Year'].isin(aligned_years)] if aligned_years else finished_yearly
-            finished_only = finished_yearly[finished_yearly['Year'].isin(excluded_years['indonesia_only'])] if excluded_years['indonesia_only'] else pd.DataFrame()
-            
-            # Data yang dibandingkan 
-            if not finished_aligned.empty:
-                fig.add_trace(go.Scatter(
-                    x=finished_aligned['Year'],
-                    y=finished_aligned['Value'],
-                    mode='lines+markers',
-                    name='Ekspor Indonesia (dibandingkan)',
-                    line=dict(color='#2ca02c', width=3),
-                    marker=dict(size=8)
-                ))
-            
-            # Data yang TIDAK dibandingkan 
-            if not finished_only.empty:
-                fig.add_trace(go.Scatter(
-                    x=finished_only['Year'],
-                    y=finished_only['Value'],
-                    mode='lines+markers',
-                    name='Ekspor Indonesia (tidak dibandingkan)',
-                    line=dict(color='#2ca02c', width=2, dash='dash'),
-                    marker=dict(size=6, symbol='circle-open'),
-                    opacity=0.6
-                ))
-
-        fig.update_layout(
-            xaxis_title="Tahun",
-            yaxis_title="Nilai (USD)",
-            height=450,
-            hovermode='x unified',
-            legend=dict(
-                orientation="v",
-                yanchor="top",
-                y=0.99,
-                xanchor="left",
-                x=0.01,
-                bgcolor='rgba(255, 255, 255, 0.8)'
-            )
-        )
-
-        if global_yearly.empty and finished_yearly.empty:
-            st.warning("Tidak ada data permintaan global untuk ditampilkan")
-        else:
-            st.plotly_chart(fig, width='stretch')
-            
-            # Tampilkan keterangan
-            if excluded_years['global_only'] or excluded_years['indonesia_only']:
-                st.caption(" Garis putus-putus menunjukkan data yang ditampilkan tetapi tidak digunakan dalam perhitungan metrik karena tidak ada data pembanding.")
+    st.markdown("#### 📊 Data Permintaan Global (Demand)")
+    if not demand_yearly.empty:
+        st.dataframe(demand_yearly, use_container_width=True)
+        st.info(f"📈 Total records: {len(demand_data)} | Columns: {list(demand_data.columns)}")
+    else:
+        st.info("Data demand tidak tersedia")
+        if not demand_data.empty:
+            st.warning(f"Data ada tapi kosong setelah aggregate. Columns: {list(demand_data.columns)}")
+            st.dataframe(demand_data.head(), use_container_width=True)
 
 
 def main():

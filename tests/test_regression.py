@@ -5,7 +5,7 @@ Verifies that various AI output formats are correctly cleaned for UN Comtrade AP
 import sys
 sys.path.insert(0, 'src')
 
-from utils import clean_hs_code, extract_hs_codes_from_ai, get_best_hs_code, get_hs_code_description
+from utils import clean_hs_code, extract_hs_codes_from_ai, get_best_hs_code, get_hs_code_description, select_hs_codes_with_conflict_resolution
 
 
 print("=== TEST: HS Code Cleaning ===\n")
@@ -104,5 +104,41 @@ finished_code = get_best_hs_code(ai_result_kelapa, 'finished')
 print(f"  Raw:      {raw_code} - {get_hs_code_description(ai_result_kelapa, 'raw', raw_code)}")
 print(f"  Semi:     {semi_code} - {get_hs_code_description(ai_result_kelapa, 'semi', semi_code)}")
 print(f"  Finished: {finished_code} - {get_hs_code_description(ai_result_kelapa, 'finished', finished_code)}")
+
+print("\n=== TEST: Moringa (Kelor) Conflict Resolution ===\n")
+
+# Test case for moringa where raw and semi have same HS code initially
+ai_result_moringa = {
+    "commodity_name": "Moringa (Kelor) Leaves",
+    "raw_hs_codes": [
+        {"code": "1211.90", "description": "Plants and parts of plants (including seeds and fruits), of a kind used primarily in perfumery, in pharmacy or for insecticidal, fungicidal or similar purposes, fresh or dried, whether or not cut, crushed or powdered: Other"},
+        {"code": "1211.90.90", "description": "Other (specific for plants used in perfumery, pharmacy, etc.)"}
+    ],
+    "semi_hs_codes": [
+        {"code": "1211.90", "description": "Plants and parts of plants (including seeds and fruits), of a kind used primarily in perfumery, in pharmacy or for insecticidal, fungicidal or similar purposes, fresh or dried, whether or not cut, crushed or powdered: Other"},
+        {"code": "2106.90", "description": "Food preparations not elsewhere specified or included: Other"}
+    ],
+    "finished_hs_codes": [
+        {"code": "3004.90", "description": "Medicaments (excluding goods of heading 3002, 3005 or 3006) consisting of mixed or unmixed products for therapeutic or prophylactic uses, put up in measured doses (including those in the form of transdermal administration systems) or in forms or packings for retail sale: Other"},
+        {"code": "3004.90.90", "description": "Other (specific for medicaments)"},
+        {"code": "2106.90", "description": "Food preparations not elsewhere specified or included: Other"}
+    ]
+}
+
+print("Before conflict resolution (old method):")
+old_raw = get_best_hs_code(ai_result_moringa, 'raw')
+old_semi = get_best_hs_code(ai_result_moringa, 'semi')
+old_finished = get_best_hs_code(ai_result_moringa, 'finished')
+print(f"  Raw:      {old_raw} - {get_hs_code_description(ai_result_moringa, 'raw', old_raw)}")
+print(f"  Semi:     {old_semi} - {get_hs_code_description(ai_result_moringa, 'semi', old_semi)}")
+print(f"  Finished: {old_finished} - {get_hs_code_description(ai_result_moringa, 'finished', old_finished)}")
+print(f"  ⚠️  Conflict: Raw and Semi have same HS code: {old_raw}")
+
+print("\nAfter conflict resolution (new method):")
+resolved_codes = select_hs_codes_with_conflict_resolution(ai_result_moringa)
+print(f"  Raw:      {resolved_codes['raw']} - {get_hs_code_description(ai_result_moringa, 'raw', resolved_codes['raw'])}")
+print(f"  Semi:     {resolved_codes['semi']} - {get_hs_code_description(ai_result_moringa, 'semi', resolved_codes['semi'])}")
+print(f"  Finished: {resolved_codes['finished']} - {get_hs_code_description(ai_result_moringa, 'finished', resolved_codes['finished'])}")
+print("  ✅ No conflicts: Each stage has different HS code"if resolved_codes['raw'] != resolved_codes['semi'] and resolved_codes['semi'] != resolved_codes['finished'] else "  ⚠️  Still has conflicts (fallback used)")
 
 print("\n=== DONE ===")

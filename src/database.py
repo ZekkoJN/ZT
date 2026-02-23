@@ -103,6 +103,7 @@ class DatabaseManager:
                     user_input VARCHAR(255) NOT NULL,
                     commodity_name VARCHAR(255),
                     raw_hs_code VARCHAR(10),
+                    semi_hs_code VARCHAR(10),
                     finished_hs_code VARCHAR(10),
                     ai_extraction JSON,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -127,20 +128,15 @@ class DatabaseManager:
                 )
             """)
 
-            # Tabel 3: Hasil analisis
+            # Tabel 3: Hasil analisis (diupdate untuk sistem optimasi)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS analysis_results (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     commodity_name VARCHAR(255),
                     raw_hs_code VARCHAR(10),
+                    semi_hs_code VARCHAR(10),
                     finished_hs_code VARCHAR(10),
-                    raw_export_value DECIMAL(20, 2),
-                    finished_export_value DECIMAL(20, 2),
-                    global_demand_value DECIMAL(20, 2),
-                    market_gap DECIMAL(20, 2),
-                    cagr_raw DECIMAL(10, 2),
-                    cagr_finished DECIMAL(10, 2),
-                    recommendation VARCHAR(50),
+                    optimization_results JSON,
                     analysis_summary TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_commodity (commodity_name),
@@ -163,6 +159,7 @@ class DatabaseManager:
         user_input: str,
         ai_extraction: Dict,
         raw_hs_code: str,
+        semi_hs_code: str,
         finished_hs_code: str
     ) -> bool:
         """
@@ -172,6 +169,7 @@ class DatabaseManager:
             user_input: Input asli dari user
             ai_extraction: Hasil ekstraksi AI
             raw_hs_code: Kode HS bahan mentah
+            semi_hs_code: Kode HS setengah jadi
             finished_hs_code: Kode HS produk jadi
 
         Returns:
@@ -184,14 +182,15 @@ class DatabaseManager:
 
             query = """
                 INSERT INTO commodity_searches
-                (user_input, commodity_name, raw_hs_code, finished_hs_code, ai_extraction)
-                VALUES (%s, %s, %s, %s, %s)
+                (user_input, commodity_name, raw_hs_code, semi_hs_code, finished_hs_code, ai_extraction)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """
 
             values = (
                 user_input,
                 ai_extraction.get('commodity_name'),
                 raw_hs_code,
+                semi_hs_code,
                 finished_hs_code,
                 json.dumps(ai_extraction)
             )
@@ -361,24 +360,17 @@ class DatabaseManager:
 
             query = """
                 INSERT INTO analysis_results
-                (commodity_name, raw_hs_code, finished_hs_code,
-                 raw_export_value, finished_export_value, global_demand_value,
-                 market_gap, cagr_raw, cagr_finished,
-                 recommendation, analysis_summary)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (commodity_name, raw_hs_code, semi_hs_code, finished_hs_code,
+                 optimization_results, analysis_summary)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """
 
             values = (
                 analysis.get('commodity_name'),
                 analysis.get('raw_hs_code'),
+                analysis.get('semi_hs_code'),
                 analysis.get('finished_hs_code'),
-                analysis.get('raw_export_value'),
-                analysis.get('finished_export_value'),
-                analysis.get('global_demand_value'),
-                analysis.get('market_gap'),
-                analysis.get('cagr_raw'),
-                analysis.get('cagr_finished'),
-                analysis.get('recommendation'),
+                json.dumps(analysis.get('optimization_results', {})),
                 analysis.get('analysis_summary')
             )
 

@@ -5,8 +5,8 @@ Menangani pemahaman bahasa natural untuk klasifikasi komoditas
 
 import os
 import threading
-from google import genai
-from google.genai import types
+import google.generativeai as genai
+from google.generativeai import types
 from typing import Dict, List, Optional
 import logging
 import json
@@ -27,19 +27,41 @@ class GeminiService:
 
     def __init__(self, api_key: Optional[str] = None):
         """
-        Inisialisasi Gemini service
+        Inisialisasi Gemini service dengan smart load balancing
 
         Args:
             api_key: Google Gemini API key (jika None, muat dari env)
         """
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self.api_keys = [
+            api_key or os.getenv("GEMINI_API_KEY"),
+            os.getenv("GEMINI_API_KEY_BACKUP")
+        ]
+        
+        # Remove None values
+        self.api_keys = [key for key in self.api_keys if key]
+        
+        if not self.api_keys:
+            raise ValueError("No GEMINI_API_KEY found in environment")
 
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment")
-
-        self.client = genai.Client(api_key=self.api_key)
-
-        logger.info("Gemini service berhasil diinisialisasi")
+        # Initialize all clients for faster switching
+        self.clients = {}
+        self.current_key_index = 0
+        
+        for i, key in enumerate(self.api_keys):
+            try:
+                genai.configure(api_key=key)
+                self.clients[key] = genai.GenerativeModel('gemini-pro')
+                logger.info(f"Gemini client {i+1} initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Gemini client {i+1}: {e}")
+        
+        if not self.clients:
+            raise ValueError("All Gemini API keys failed to initialize")
+        
+        # Start with primary client
+        self.client = self.clients[self.api_keys[0]]
+        self.api_key = self.api_keys[0]
+        logger.info("Gemini service initialized with smart load balancing")
 
     def extract_commodity_keywords(self, user_input: str) -> Dict:
         """
@@ -156,9 +178,8 @@ Sekarang analisis input pengguna "{user_input}" dengan mempertimbangkan konteks 
 """
 
         try:
-            response = self.client.models.generate_content(
-                model='models/gemini-2.5-flash',
-                contents=prompt
+            response = self.client.generate_content(
+                prompt
             )
             result_text = response.text.strip()
 
@@ -174,71 +195,178 @@ Sekarang analisis input pengguna "{user_input}" dengan mempertimbangkan konteks 
             logger.info(f"Successfully extracted keywords for: {user_input}")
             return result
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Gagal parse JSON response: {e}")
-            # Fallback: kembalikan struktur dasar
-            return {
-                "commodity_name": user_input,
-                "input_stage": "raw",
-                "raw_material": user_input,
-                "semi_finished": f"{user_input} processed",
-                "finished_product": f"{user_input} finished",
-                "keywords": [user_input],
-                "raw_hs_codes": [],
-                "semi_hs_codes": [],
-                "finished_hs_codes": [],
-                "industry_category": "manufacturing",
-                "selected_path_reason": "Default path selected based on user input",
-                "user_position_note": None
-            }
         except Exception as e:
-            logger.error(f"Error saat memanggil Gemini API: {e}")
-            raise
+            error_msg = str(e).lower()
+            
+            # Check for quota/rate limit errors - switch immediately to backup
+            quota_indicators = [
+                'quota exceeded', 'rate limit', 'resource exhausted', 
+                'billing', 'insufficient_quota', 'quota_exceeded',
+                '429', 'rate_limit_exceeded'
+            ]
+            
+            is_quota_error = any(indicator in error_msg for indicator in quota_indicators)
+            
+            if is_quota_error:
+                logger.warning(f"Quota error detected with current key, switching to backup immediately: {e}")
+                
+                # Try backup keys immediately for quota issues
+                for backup_key in self.api_keys:
+                    if backup_key == self.api_key:
+                        continue
+                        
+                    try:
+                        logger.info(f"Trying backup Gemini API key for quota issue...")
+                        backup_client = self.clients.get(backup_key)
+                        if not backup_client:
+                            logger.warning(f"Backup client not available for key: {backup_key[:20]}...")
+                            continue
+                            
+                        response = backup_client.models.generate_content(
+                            model='models/gemini-2.5-flash',
+                            contents=prompt
+                        )
+                        result_text = response.text.strip()
+                        
+                        # Parse JSON
+                        if "```json" in result_text:
+                            result_text = result_text.split("```json")[1].split("```")[0].strip()
+                        elif "```" in result_text:
+                            result_text = result_text.split("```")[1].split("```")[0].strip()
+
+                        result = json.loads(result_text)
+                        
+                        logger.info(f"Successfully extracted keywords using backup key: {user_input}")
+                        
+                        # Switch to backup key as primary for future requests
+                        self.client = backup_client
+                        self.api_key = backup_key
+                        self.current_key_index = self.api_keys.index(backup_key)
+                        
+                        return result
+                        
+                    except Exception as backup_e:
+                        logger.warning(f"Backup Gemini API key also failed: {backup_e}")
+                        continue
+                
+                # If all keys failed, return fallback
+                logger.error(f"All Gemini API keys failed for quota issue: {user_input}")
+                return self._get_fallback_result(user_input)
+            else:
+                # For non-quota errors, try other keys as well
+                logger.warning(f"Non-quota error with current key, trying backups: {e}")
+                
+                for backup_key in self.api_keys:
+                    if backup_key == self.api_key:
+                        continue
+                        
+                    try:
+                        logger.info(f"Trying backup Gemini API key for general error...")
+                        backup_client = self.clients.get(backup_key)
+                        if not backup_client:
+                            continue
+                            
+                        response = backup_client.models.generate_content(
+                            model='models/gemini-2.5-flash',
+                            contents=prompt
+                        )
+                        result_text = response.text.strip()
+                        
+                        # Parse JSON
+                        if "```json" in result_text:
+                            result_text = result_text.split("```json")[1].split("```")[0].strip()
+                        elif "```" in result_text:
+                            result_text = result_text.split("```")[1].split("```")[0].strip()
+
+                        result = json.loads(result_text)
+                        
+                        logger.info(f"Successfully extracted keywords using backup key: {user_input}")
+                        return result
+                        
+                    except Exception as backup_e:
+                        logger.warning(f"Backup Gemini API key also failed: {backup_e}")
+                        continue
+                
+                # If all keys failed, return fallback
+                logger.error(f"All Gemini API keys failed for input: {user_input}")
+                return self._get_fallback_result(user_input)
+
+    def _get_fallback_result(self, user_input: str) -> Dict:
+        """
+        Return fallback result when all API keys fail
+        
+        Args:
+            user_input: Original user input
+            
+        Returns:
+            Fallback dictionary result
+        """
+        return {
+            "commodity_name": user_input,
+            "input_stage": "raw",
+            "raw_material": user_input,
+            "semi_finished": f"{user_input} processed",
+            "finished_product": f"{user_input} finished",
+            "keywords": [user_input],
+            "raw_hs_codes": [],
+            "semi_hs_codes": [],
+            "finished_hs_codes": [],
+            "industry_category": "manufacturing",
+            "selected_path_reason": "Default path selected due to API failure",
+            "user_position_note": None
+        }
 
     def generate_analysis_summary(
         self,
         commodity: str,
-        raw_data: Dict,
-        finished_data: Dict,
-        recommendations: Dict
+        optimization_results: Dict
     ) -> str:
         """
         Generate ringkasan analisis yang mudah dibaca menggunakan Gemini
+        Berdasarkan hasil optimasi matematis Gurobi
 
         Args:
             commodity: Nama komoditas
-            raw_data: Data ekspor bahan mentah
-            finished_data: Data ekspor/impor produk jadi
-            recommendations: Rekomendasi analisis
+            optimization_results: Hasil optimasi dari Gurobi (raw, semi, finished)
 
         Returns:
             Ringkasan bahasa natural
         """
         prompt = f"""
-Kamu adalah analis ekonomi ekspor Indonesia. Buatkan ringkasan analisis hilirisasi untuk komoditas berikut:
+Kamu adalah analis ekonomi ekspor Indonesia. Buatkan ringkasan analisis hilirisasi untuk komoditas berikut berdasarkan hasil optimasi matematis:
 
 KOMODITAS: {commodity}
 
-DATA BAHAN MENTAH (Ekspor Indonesia):
-- Total Nilai: ${raw_data.get('total_value', 0):,.2f}
-- Trend Pertumbuhan (CAGR): {raw_data.get('cagr', 0)}%
+HASIL OPTIMASI MATEMATIS (Gurobi):
 
-DATA PRODUK JADI:
-- Ekspor Indonesia: ${finished_data.get('export_value', 0):,.2f}
-- Impor Dunia (Demand): ${finished_data.get('world_import', 0):,.2f}
-- Gap (Peluang): ${finished_data.get('gap', 0):,.2f}
-- Trend Pertumbuhan (CAGR): {finished_data.get('cagr', 0)}%
+"""
+        # Tambahkan data untuk setiap stage yang ada
+        stages = [('raw', 'Bahan Mentah'), ('semi', 'Setengah Jadi'), ('finished', 'Produk Jadi')]
 
-REKOMENDASI: {recommendations.get('decision', 'N/A')}
-ALASAN UTAMA: {recommendations.get('reason', 'N/A')}
+        for stage_key, stage_name in stages:
+            if stage_key in optimization_results:
+                opt = optimization_results[stage_key]
+                if opt.get('status') == 'Optimal':
+                    prompt += f"""
+{stage_name.upper()}:
+- Potensi Devisa: ${opt.get('total_revenue', 0):,.2f}
+- Volume Alokasi: {opt.get('total_volume', 0):,.2f} kg
+- Strategi: {opt.get('strategy', 'N/A')}
+"""
+                else:
+                    prompt += f"""
+{stage_name.upper()}: Optimasi gagal - {opt.get('reason', 'Unknown error')}
+"""
+
+        prompt += """
 
 Buatkan ringkasan analisis dalam 3-4 paragraf yang mudah dipahami, mencakup:
-1. Kondisi ekspor bahan mentah saat ini
-2. Analisis permintaan global untuk produk jadi
-3. Potensi nilai tambah ekonomi dari hilirisasi
-4. Rekomendasi strategis
+1. Potensi ekonomi dari optimasi matematis untuk setiap tahap
+2. Strategi yang direkomendasikan (B1: Competitor Displacement atau B3: Price Arbitrage)
+3. Volume dan nilai devisa yang dapat dicapai
+4. Rekomendasi implementasi strategis
 
-Gunakan bahasa yang profesional namun mudah dipahami untuk pembuat keputusan bisnis.
+Gunakan bahasa yang profesional namun mudah dipahami untuk pembuat keputusan bisnis dan fokus pada hasil optimasi matematis.
 """
 
         try:

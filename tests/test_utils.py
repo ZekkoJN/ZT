@@ -15,10 +15,8 @@ from utils import (
     extract_hs_codes_from_ai,
     get_best_hs_code,
     get_hs_code_description,
-    calculate_cagr,
-    calculate_value_added,
-    format_currency,
-    validate_hscode
+    validate_hscode,
+    select_hs_codes_with_conflict_resolution
 )
 
 
@@ -106,54 +104,53 @@ class TestHSCodeCleaning(unittest.TestCase):
         desc_missing = get_hs_code_description(ai_result, 'raw', "999999")
         self.assertEqual(desc_missing, "N/A")
 
+    def test_select_hs_codes_with_conflict_resolution(self):
+        """Test HS code selection with conflict resolution"""
+        # Test case: normal case without conflicts
+        ai_result_normal = {
+            "raw_hs_codes": [{"code": "0801.12", "description": "Coconuts"}],
+            "semi_hs_codes": [{"code": "1513.11", "description": "Coconut oil"}],
+            "finished_hs_codes": [{"code": "3401.11", "description": "Soap"}]
+        }
+        
+        result = select_hs_codes_with_conflict_resolution(ai_result_normal)
+        self.assertEqual(result['raw'], "080112")
+        self.assertEqual(result['semi'], "151311")
+        self.assertEqual(result['finished'], "340111")
 
-class TestCalculationFunctions(unittest.TestCase):
-    """Test calculation helper functions"""
+        # Test case: conflict between raw and semi (moringa case)
+        ai_result_conflict = {
+            "raw_hs_codes": [
+                {"code": "1211.90", "description": "Plants fresh"},
+                {"code": "1211.91", "description": "Plants dried"}
+            ],
+            "semi_hs_codes": [
+                {"code": "1211.90", "description": "Plants fresh"},  # Same as raw first choice
+                {"code": "2106.90", "description": "Food preparations"}
+            ],
+            "finished_hs_codes": [{"code": "3004.90", "description": "Medicaments"}]
+        }
+        
+        result = select_hs_codes_with_conflict_resolution(ai_result_conflict)
+        self.assertEqual(result['raw'], "121190")      # First choice for raw
+        self.assertEqual(result['semi'], "210690")     # Skip 121190, use alternative
+        self.assertEqual(result['finished'], "300490") # No conflict
 
-    def test_calculate_cagr_positive_growth(self):
-        """Test CAGR calculation with positive growth"""
-        cagr = calculate_cagr(100, 150, 3)
-        self.assertGreater(cagr, 0)
-        self.assertAlmostEqual(cagr, 14.47, places=1)
-
-    def test_calculate_cagr_negative_growth(self):
-        """Test CAGR calculation with negative growth"""
-        cagr = calculate_cagr(150, 100, 3)
-        self.assertLess(cagr, 0)
-
-    def test_calculate_cagr_zero_values(self):
-        """Test CAGR with zero values"""
-        cagr = calculate_cagr(0, 100, 3)
-        self.assertEqual(cagr, 0.0)
-
-    def test_calculate_value_added(self):
-        """Test value added calculation"""
-        value_added = calculate_value_added(100, 200)
-        self.assertEqual(value_added, 100.0)
-
-        value_added = calculate_value_added(50, 75)
-        self.assertEqual(value_added, 50.0)
-
-    def test_calculate_value_added_zero_raw(self):
-        """Test value added with zero raw price"""
-        value_added = calculate_value_added(0, 100)
-        self.assertEqual(value_added, 0.0)
+        # Test case: no alternatives available (fallback to duplicate)
+        ai_result_no_alt = {
+            "raw_hs_codes": [{"code": "1211.90", "description": "Plants"}],
+            "semi_hs_codes": [{"code": "1211.90", "description": "Plants"}],  # Same, no alternative
+            "finished_hs_codes": [{"code": "3004.90", "description": "Medicaments"}]
+        }
+        
+        result = select_hs_codes_with_conflict_resolution(ai_result_no_alt)
+        self.assertEqual(result['raw'], "121190")
+        self.assertEqual(result['semi'], "121190")     # Fallback to duplicate
+        self.assertEqual(result['finished'], "300490")
 
 
 class TestFormattingFunctions(unittest.TestCase):
     """Test formatting helper functions"""
-
-    def test_format_currency_usd(self):
-        """Test USD currency formatting"""
-        formatted = format_currency(1234567.89, "USD")
-        self.assertIn("$", formatted)
-        self.assertIn("1,234,567.89", formatted)
-
-    def test_format_currency_other(self):
-        """Test other currency formatting"""
-        formatted = format_currency(1000, "EUR")
-        self.assertIn("EUR", formatted)
-        self.assertIn("1,000.00", formatted)
 
     def test_validate_hscode_valid(self):
         """Test HS code validation with valid codes"""
@@ -174,7 +171,6 @@ def suite():
     """Create test suite"""
     suite = unittest.TestSuite()
     suite.addTest(unittest.makeSuite(TestHSCodeCleaning))
-    suite.addTest(unittest.makeSuite(TestCalculationFunctions))
     suite.addTest(unittest.makeSuite(TestFormattingFunctions))
     return suite
 

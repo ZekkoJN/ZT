@@ -124,6 +124,53 @@ def get_best_hs_code(ai_result: Dict, stage: str) -> Optional[str]:
     return codes[0] if codes else None
 
 
+def select_hs_codes_with_conflict_resolution(ai_result: Dict) -> Dict[str, Optional[str]]:
+    """
+    Pilih HS code terbaik untuk semua stage (raw, semi, finished) dengan resolusi konflik.
+    
+    Logic:
+    1. Prioritas: raw → semi → finished (urutan pemilihan)
+    2. Untuk setiap stage, ambil HS code pertama yang tersedia
+    3. Jika HS code sudah digunakan stage sebelumnya, skip dan ambil alternatif berikutnya
+    4. Jika tidak ada alternatif, gunakan HS code yang sama (sebagai fallback)
+    
+    Args:
+        ai_result: Dictionary hasil dari Gemini AI
+        
+    Returns:
+        Dictionary dengan keys: 'raw', 'semi', 'finished' dan values berupa HS code atau None
+    """
+    result = {'raw': None, 'semi': None, 'finished': None}
+    used_codes = set()
+    
+    stages = ['raw', 'semi', 'finished']
+    
+    for stage in stages:
+        codes = extract_hs_codes_from_ai(ai_result, stage)
+        
+        if not codes:
+            logger.warning(f"Tidak ada HS codes untuk stage: {stage}")
+            continue
+            
+        # Cari kode yang belum digunakan
+        selected_code = None
+        for code in codes:
+            if code not in used_codes:
+                selected_code = code
+                used_codes.add(code)
+                break
+        
+        # Jika semua kode sudah digunakan, gunakan yang pertama sebagai fallback
+        # (meskipun duplikat, tapi setidaknya ada data)
+        if selected_code is None:
+            selected_code = codes[0]
+            logger.warning(f"Semua HS codes untuk {stage} sudah digunakan stage sebelumnya, menggunakan fallback: {selected_code}")
+        
+        result[stage] = selected_code
+        
+    return result
+
+
 def get_hs_code_description(ai_result: Dict, stage: str, hs_code: str) -> str:
     """
     Ambil deskripsi HS code dari hasil AI.
@@ -154,60 +201,6 @@ def get_hs_code_description(ai_result: Dict, stage: str, hs_code: str) -> str:
                 return item.get('description', 'N/A')
     
     return 'N/A'
-
-
-def calculate_cagr(start_value: float, end_value: float, years: int) -> float:
-    """
-    Hitung Compound Annual Growth Rate (CAGR)
-
-    Args:
-        start_value: Nilai awal
-        end_value: Nilai akhir
-        years: Jumlah tahun
-
-    Returns:
-        CAGR dalam persentase
-    """
-    if start_value <= 0 or end_value <= 0 or years <= 0:
-        return 0.0
-
-    cagr = ((end_value / start_value) ** (1 / years) - 1) * 100
-    return round(cagr, 2)
-
-
-def calculate_value_added(raw_price: float, finished_price: float) -> float:
-    """
-    Hitung persentase Economic Value Added
-
-    Args:
-        raw_price: Harga per unit bahan mentah
-        finished_price: Harga per unit produk jadi
-
-    Returns:
-        Persentase value added
-    """
-    if raw_price <= 0:
-        return 0.0
-
-    value_added = ((finished_price - raw_price) / raw_price) * 100
-    return round(value_added, 2)
-
-
-def format_currency(amount: float, currency: str = "USD") -> str:
-    """
-    Format mata uang untuk ditampilkan
-
-    Args:
-        amount: Jumlah yang akan diformat
-        currency: Kode mata uang
-
-    Returns:
-        String mata uang terformat
-    """
-    if currency == "USD":
-        return f"${amount:,.2f}"
-    else:
-        return f"{currency} {amount:,.2f}"
 
 
 def format_currency_compact(amount: float) -> str:
